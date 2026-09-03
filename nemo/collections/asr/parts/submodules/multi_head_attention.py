@@ -1099,7 +1099,7 @@ class PositionalEncoding(torch.nn.Module):
         input_len = x.size(1) + cache_len
         if self.xscale:
             x = x * self.xscale
-        pos_emb = self.pe[:, :input_len]
+        pos_emb = self.pe[:, :input_len].clone()
         if self.dropout_emb:
             pos_emb = self.dropout_emb(pos_emb)
         x = x + pos_emb
@@ -1147,7 +1147,7 @@ class RelPositionalEncoding(PositionalEncoding):
         center_pos = self.pe.size(1) // 2 + 1
         start_pos = center_pos - input_len
         end_pos = center_pos + input_len - 1
-        pos_emb = self.pe[:, start_pos:end_pos]
+        pos_emb = self.pe[:, start_pos:end_pos].clone()
         if self.dropout_emb:
             pos_emb = self.dropout_emb(pos_emb)
         return self.dropout(x), pos_emb

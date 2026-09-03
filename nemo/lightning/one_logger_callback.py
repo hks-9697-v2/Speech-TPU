@@ -22,11 +22,20 @@ from typing import Any, Dict
 
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
-from nv_one_logger.api.config import OneLoggerConfig
-from nv_one_logger.training_telemetry.api.callbacks import on_app_start
-from nv_one_logger.training_telemetry.api.config import TrainingTelemetryConfig
-from nv_one_logger.training_telemetry.api.training_telemetry_provider import TrainingTelemetryProvider
-from nv_one_logger.training_telemetry.integration.pytorch_lightning import TimeEventCallback as OneLoggerPTLCallback
+try:
+    from nv_one_logger.api.config import OneLoggerConfig
+    from nv_one_logger.training_telemetry.api.callbacks import on_app_start
+    from nv_one_logger.training_telemetry.api.config import TrainingTelemetryConfig
+    from nv_one_logger.training_telemetry.api.training_telemetry_provider import TrainingTelemetryProvider
+    from nv_one_logger.training_telemetry.integration.pytorch_lightning import TimeEventCallback as OneLoggerPTLCallback
+except ImportError:
+    OneLoggerConfig = None
+    on_app_start = lambda *args, **kwargs: None
+    TrainingTelemetryConfig = None
+    TrainingTelemetryProvider = None
+    class OneLoggerPTLCallback:
+        def __init__(self, *args, **kwargs):
+            pass
 
 from nemo.lightning.base_callback import BaseCallback
 
@@ -233,6 +242,9 @@ class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
 
     def __init__(self) -> None:
         if getattr(self, '_initialized', False):
+            return
+        if OneLoggerConfig is None:
+            self._initialized = True
             return
         init_config = get_one_logger_init_config()
         one_logger_config = OneLoggerConfig(**init_config)

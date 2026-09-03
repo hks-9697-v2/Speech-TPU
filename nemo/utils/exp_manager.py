@@ -34,7 +34,11 @@ from hydra.utils import get_original_cwd
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks.timer import Interval, Timer
-from lightning.pytorch.loggers import MLFlowLogger, NeptuneLogger, TensorBoardLogger, WandbLogger
+from lightning.pytorch.loggers import MLFlowLogger, TensorBoardLogger, WandbLogger
+try:
+    from lightning.pytorch.loggers import NeptuneLogger
+except ImportError:
+    NeptuneLogger = None
 from lightning.pytorch.loops import _TrainingEpochLoop
 from lightning.pytorch.strategies.ddp import DDPStrategy
 from lightning.pytorch.trainer.connectors.checkpoint_connector import _CheckpointConnector

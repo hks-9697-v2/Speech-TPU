@@ -727,14 +727,26 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             else:
                 cache_last_channel_cur = None
                 cache_last_time_cur = None
-            audio_signal = layer(
-                x=audio_signal,
-                att_mask=att_mask,
-                pos_emb=pos_emb,
-                pad_mask=pad_mask,
-                cache_last_channel=cache_last_channel_cur,
-                cache_last_time=cache_last_time_cur,
-            )
+            if getattr(self, "use_remat", False) and self.training:
+                audio_signal = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    audio_signal,
+                    att_mask,
+                    pos_emb,
+                    pad_mask,
+                    cache_last_channel_cur,
+                    cache_last_time_cur,
+                    use_reentrant=False,
+                )
+            else:
+                audio_signal = layer(
+                    x=audio_signal,
+                    att_mask=att_mask,
+                    pos_emb=pos_emb,
+                    pad_mask=pad_mask,
+                    cache_last_channel=cache_last_channel_cur,
+                    cache_last_time=cache_last_time_cur,
+                )
 
             if cache_last_channel_cur is not None:
                 (audio_signal, cache_last_channel_cur, cache_last_time_cur) = audio_signal
