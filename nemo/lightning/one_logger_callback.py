@@ -257,6 +257,8 @@ class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
         on_app_start()
 
     def update_config(self, nemo_version: str, trainer: Trainer, **kwargs) -> None:
+        if TrainingTelemetryProvider is None:
+            return
         # Avoid this function being called multiple times
         if TrainingTelemetryProvider.instance().config.telemetry_config is not None:
             return

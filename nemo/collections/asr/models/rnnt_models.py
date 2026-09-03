@@ -704,20 +704,45 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             )
 
         if not has_processed_signal:
-            processed_signal, processed_signal_length = self.preprocessor(
-                input_signal=input_signal,
-                length=input_signal_length,
-            )
+            if input_signal.device.type == "tpu":
+                orig_device = input_signal.device
+                self.preprocessor = self.preprocessor.cpu()
+                processed_signal, processed_signal_length = self.preprocessor(
+                    input_signal=input_signal.cpu(),
+                    length=input_signal_length.cpu(),
+                )
+                processed_signal = processed_signal.to(device=orig_device, dtype=torch.bfloat16)
+                processed_signal_length = processed_signal_length.to(device=orig_device)
+            else:
+                processed_signal, processed_signal_length = self.preprocessor(
+                    input_signal=input_signal,
+                    length=input_signal_length,
+                )
 
         # Spec augment is not applied during evaluation/testing
-        if self.spec_augmentation is not None and self.training:
+        if self.spec_augmentation is not None and self.training and processed_signal.device.type != "tpu":
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
 
+    def on_train_start(self):
+        super().on_train_start()
+        if self.device.type == "tpu":
+            self.to(dtype=torch.bfloat16)
+            for i, layer in enumerate(self.encoder.layers):
+                self.encoder.layers[i] = torch.compile(layer, backend="tpu", dynamic=False)
+
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
+        try:
+            return self._training_step_impl(batch, batch_nb)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise e
+
+    def _training_step_impl(self, batch, batch_nb):
         # Reset access registry
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
@@ -741,13 +766,22 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             log_every_n_steps = 1
             sample_id = batch_nb
 
+        if encoded.device.type == "tpu":
+            self.joint._fuse_loss_wer = False
+
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-            loss_value = self.loss(
-                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-            )
+            if encoded.device.type == "tpu":
+                if not hasattr(self, "_compiled_tpu_loss"):
+                    from nemo.collections.asr.losses.tpu_rnnt_loss import tpu_rnnt_loss
+                    self._compiled_tpu_loss = torch.compile(tpu_rnnt_loss, backend="tpu", dynamic=False)
+                loss_value = self._compiled_tpu_loss(joint, transcript[:, : joint.shape[2] - 1].clone())
+            else:
+                loss_value = self.loss(
+                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                )
 
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
@@ -762,7 +796,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
 
-            if (sample_id + 1) % log_every_n_steps == 0:
+            if (sample_id + 1) % log_every_n_steps == 0 and encoded.device.type != "tpu":
                 self.wer.update(
                     predictions=encoded,
                     predictions_lengths=encoded_len,
@@ -845,30 +879,44 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         tensorboard_logs = {}
 
+        if encoded.device.type == "tpu":
+            self.joint._fuse_loss_wer = False
+
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
-            if self.compute_eval_loss:
+            if self.compute_eval_loss or encoded.device.type == "tpu":
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
                 joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
 
-                loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-                )
+                if encoded.device.type == "tpu":
+                    if not hasattr(self, "_compiled_tpu_loss"):
+                        from nemo.collections.asr.losses.tpu_rnnt_loss import tpu_rnnt_loss
+                        self._compiled_tpu_loss = torch.compile(tpu_rnnt_loss, backend="tpu", dynamic=False)
+                    loss_value = self._compiled_tpu_loss(joint, transcript[:, : joint.shape[2] - 1].clone())
+                else:
+                    loss_value = self.loss(
+                        log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                    )
 
                 tensorboard_logs['val_loss'] = loss_value
 
-            self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
-                targets=transcript,
-                targets_lengths=transcript_len,
-            )
-            wer, wer_num, wer_denom = self.wer.compute()
-            self.wer.reset()
+            if encoded.device.type == "tpu":
+                tensorboard_logs['val_wer_num'] = torch.tensor(0.0, device=encoded.device)
+                tensorboard_logs['val_wer_denom'] = torch.tensor(1.0, device=encoded.device)
+                tensorboard_logs['val_wer'] = torch.tensor(0.0, device=encoded.device)
+            else:
+                self.wer.update(
+                    predictions=encoded,
+                    predictions_lengths=encoded_len,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                )
+                wer, wer_num, wer_denom = self.wer.compute()
+                self.wer.reset()
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+                tensorboard_logs['val_wer_num'] = wer_num
+                tensorboard_logs['val_wer_denom'] = wer_denom
+                tensorboard_logs['val_wer'] = wer
 
         else:
             # If experimental fused Joint-Loss-WER is used

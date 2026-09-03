@@ -37,6 +37,79 @@ _FLASH_PRECISION_ALIASES = {
 }
 
 
+import os
+import lightning.pytorch as pl
+
+
+class TorchTPUAccelerator(pl.accelerators.Accelerator):
+    def setup_device(self, device: torch.device) -> None:
+        pass
+
+    def get_device_stats(self, device: torch.device) -> dict:
+        return {}
+
+    def teardown(self) -> None:
+        pass
+
+    @staticmethod
+    def parse_devices(devices):
+        if isinstance(devices, int):
+            return list(range(devices))
+        return devices
+
+    @staticmethod
+    def get_parallel_devices(devices):
+        if isinstance(devices, int):
+            return [torch.device("tpu")] * devices
+        return [torch.device("tpu")] * len(devices)
+
+    @staticmethod
+    def auto_device_count() -> int:
+        return int(os.environ.get("WORLD_SIZE", 1))
+
+    @staticmethod
+    def is_available() -> bool:
+        return True
+
+    @staticmethod
+    def name() -> str:
+        return "tpu"
+
+
+class TorchTPUStrategy(pl.strategies.DDPStrategy):
+    def __init__(self, **kwargs):
+        super().__init__(process_group_backend="tpu_dist", **kwargs)
+
+    @property
+    def root_device(self) -> torch.device:
+        return torch.device("tpu")
+
+    def setup_environment(self) -> None:
+        import signal
+        import torch_tpu  # noqa: F401
+        if hasattr(signal, "SIGPROF"):
+            signal.signal(signal.SIGPROF, signal.SIG_IGN)
+        if not torch.distributed.is_initialized():
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ.setdefault("MASTER_PORT", "12355")
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            torch.distributed.init_process_group(backend="tpu_dist")
+
+    def configure_ddp(self) -> None:
+        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
+            self.model = torch.nn.parallel.DistributedDataParallel(self.model, broadcast_buffers=False)
+
+    def teardown(self) -> None:
+        import signal
+        if hasattr(signal, "SIGPROF"):
+            signal.signal(signal.SIGPROF, signal.SIG_IGN)
+        torch.tpu.synchronize()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        super().teardown()
+
+
 def resolve_trainer_cfg(trainer_cfg: DictConfig) -> DictConfig:
     """
     Resolves and processes a trainer configuration.
@@ -53,6 +126,10 @@ def resolve_trainer_cfg(trainer_cfg: DictConfig) -> DictConfig:
         A processed DictConfig with resolved configuration values
     """
     trainer_cfg = OmegaConf.to_container(trainer_cfg, resolve=True)
+
+    if trainer_cfg.get("accelerator") == "tpu":
+        trainer_cfg["accelerator"] = TorchTPUAccelerator()
+        trainer_cfg["strategy"] = TorchTPUStrategy()
 
     # Avoids downcasting 'audio' tensors in half precision setups and enables
     # the specialized flash precision plugin without mutating global dtype state.

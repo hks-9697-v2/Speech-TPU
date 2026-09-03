@@ -65,13 +65,16 @@ def _speech_collate_fn(batch, pad_id):
         _, audio_lengths, _, tokens_lengths = packed_batch
     else:
         raise ValueError("Expects 4 or 5 tensors in the batch!")
+    import os
+    static_audio_len = int(os.environ.get("NEMO_TPU_STATIC_AUDIO_LEN", 0))
+    static_tokens_len = int(os.environ.get("NEMO_TPU_STATIC_TOKENS_LEN", 0))
     max_audio_len = 0
     has_audio = audio_lengths[0] is not None
     if has_audio:
-        max_audio_len = max(audio_lengths).item()
+        max_audio_len = max(max(audio_lengths).item(), static_audio_len)
     has_tokens = tokens_lengths[0] is not None
     if has_tokens:
-        max_tokens_len = max(tokens_lengths).item()
+        max_tokens_len = max(max(tokens_lengths).item(), static_tokens_len)
 
     audio_signal, tokens = [], []
     for b in batch:
