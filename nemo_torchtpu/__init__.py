@@ -9,6 +9,17 @@ from lightning.pytorch.accelerators import Accelerator
 from lightning.pytorch.strategies import DDPStrategy
 
 
+# ==============================================================================
+# 1. PyTorch Lightning Accelerator for TorchTPU
+# ==============================================================================
+# Why this is needed:
+# - PyTorch Lightning's built-in `TPUAccelerator` strictly expects `torch_xla` and
+#   checks for `_XLA_AVAILABLE`. It has no knowledge of `torch_tpu`, which registers
+#   as PyTorch's native `PrivateUse1` backend (named "tpu").
+# - If `trainer.accelerator="tpu"` is passed without this custom Accelerator,
+#   Lightning throws `MisconfigurationException: torch_xla is required`.
+# - Subclassing `pl.accelerators.Accelerator` tells Lightning that the TPU device
+#   is available, manages TPU device handles, and bypasses the `torch_xla` import.
 class TorchTPUAccelerator(Accelerator):
     """Out-of-tree PyTorch Lightning Accelerator for TorchTPU."""
 
@@ -44,6 +55,26 @@ class TorchTPUAccelerator(Accelerator):
         return "tpu"
 
 
+# ==============================================================================
+# 2. PyTorch Lightning Distributed Strategy for TorchTPU
+# ==============================================================================
+# Why this is needed:
+# - Distributed backend: Lightning's standard `DDPStrategy` defaults to NCCL on GPU
+#   and Gloo on CPU. On TPU, distributed collective operations across chips require
+#   `process_group_backend="tpu_dist"`.
+# - `broadcast_buffers=False`: Default DDP synchronizes module buffers at the start
+#   of every forward pass across all ranks. In NeMo, the audio preprocessor is kept
+#   on CPU to perform STFT, so its internal buffers (Hann window, filterbanks) reside
+#   on CPU. `tpu_dist` cannot broadcast CPU tensors and raises:
+#   `RuntimeError: No backend type associated with device type cpu`. Setting
+#   `broadcast_buffers=False` prevents this error.
+# - Teardown synchronization: Lightning finishes training steps asynchronously.
+#   Without calling `torch.tpu.synchronize()` and `barrier()`, the Python process
+#   begins exiting while XLA execution/all-reduces are still in-flight on the TPU.
+# - `SIGPROF` signal ignore: During C++ `atexit` teardown in libtpu/PJRT, interval
+#   timers (`ITIMER_PROF`) can fire `SIGPROF` (signal 27) after the C++ signal handler
+#   has unregistered, causing the process to exit with status `-27`. Ignoring
+#   `SIGPROF` prevents this spurious teardown crash.
 class TorchTPUStrategy(DDPStrategy):
     """Out-of-tree PyTorch Lightning DDPStrategy for TorchTPU."""
 
@@ -79,6 +110,16 @@ class TorchTPUStrategy(DDPStrategy):
         super().teardown()
 
 
+# ==============================================================================
+# 3. Intercepting NeMo Trainer Configuration (`resolve_trainer_cfg`)
+# ==============================================================================
+# Why this is needed:
+# - NeMo production scripts instantiate `Trainer` using:
+#   `trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))`
+# - By intercepting `resolve_trainer_cfg`, we detect `trainer.accelerator="tpu"` and
+#   inject `TorchTPUAccelerator()` and `TorchTPUStrategy()` before Lightning's
+#   internal configuration validator runs.
+# - This allows running unmodified NeMo scripts via standard Hydra CLI overrides.
 def _patch_trainer_utils():
     import nemo.utils.trainer_utils as trainer_utils
 
@@ -98,6 +139,16 @@ def _patch_trainer_utils():
     trainer_utils.resolve_trainer_cfg = patched_resolve_trainer_cfg
 
 
+# ==============================================================================
+# 4. Safe Bypass of NVIDIA OneLogger Telemetry
+# ==============================================================================
+# Why this is needed:
+# - Upstream NeMo includes `nv_one_logger`, an NVIDIA cluster telemetry callback.
+# - When any NeMo model (`ModelPT`) is initialized, it calls `CallbackGroup.get_instance()`,
+#   which unconditionally instantiates `OneLoggerNeMoCallback()`.
+# - On TPU or non-NVIDIA environments, `OneLoggerNeMoCallback.__init__` fails because
+#   NVIDIA telemetry endpoints are unavailable. Wrapping `__init__` in a `try...except`
+#   allows training to proceed without blocking on missing NVIDIA telemetry.
 def _patch_one_logger():
     try:
         from nemo.lightning import one_logger_callback
@@ -118,6 +169,20 @@ def _patch_one_logger():
         pass
 
 
+# ==============================================================================
+# 5. ATen / Conformer Operator Fixes
+# ==============================================================================
+# Why this is needed:
+# 1. `aten::glu` decomposition: When compiling Conformer convolution/feed-forward
+#    layers with `torch.compile(backend="tpu")`, the fused GLU operator can encounter
+#    lowering or tracing issues in AOTAutograd/XLA. Decomposing `glu` into
+#    `chunk(2, dim=-1)` followed by `a * sigmoid(b)` lowers cleanly to standard
+#    elementwise XLA operations.
+# 2. Positional Encoding Buffer Slicing: In `RelPositionalEncoding.forward`, the
+#    module slices a pre-computed buffer `self.pe[:, :length]`. In AOTAutograd backward
+#    graph generation, slicing a module buffer without copying can lead to view/storage
+#    aliasing conflicts during backward pass compilation. Adding `.clone()` provides
+#    an owned, independent tensor for autograd tracing.
 def _patch_conformer_ops():
     from nemo.collections.asr.parts.submodules import conformer_modules, multi_head_attention
 
@@ -146,6 +211,16 @@ def _patch_conformer_ops():
         multi_head_attention.RelPositionalEncoding.forward = patched_pos_forward
 
 
+# ==============================================================================
+# 6. Static Shape Padding for Collation
+# ==============================================================================
+# Why this is needed:
+# - The XLA compiler compiles a separate computation graph for every unique input
+#   shape. If variable-length audio and token sequences produce different batch shapes
+#   on each step, XLA triggers expensive recompilations ("recompilation storms").
+# - Wrapping `_speech_collate_fn` to pad audio to `NEMO_TPU_STATIC_AUDIO_LEN` and
+#   tokens to `NEMO_TPU_STATIC_TOKENS_LEN` stabilizes batch tensor dimensions, ensuring
+#   zero recompilations during steady-state training.
 def _patch_audio_collate():
     from nemo.collections.asr.data import audio_to_text
 
@@ -172,6 +247,21 @@ def _patch_audio_collate():
     audio_to_text._speech_collate_fn = patched_speech_collate_fn
 
 
+# ==============================================================================
+# 7. Model Lifecycle and Loss Dispatch (`EncDecRNNTModel`)
+# ==============================================================================
+# Why this is needed:
+# 1. Preprocessor CPU Offload: `AudioToMelSpectrogramPreprocessor` relies on `torch.stft`,
+#    which uses complex numbers and FFT operations that are currently inefficient or
+#    unsupported in TorchDynamo on TPU. Running STFT on CPU in `torch.no_grad()` and
+#    transferring the resulting Mel spectrogram to TPU in `bfloat16` sidesteps this.
+# 2. Block Compilation (`on_train_start`): Top-level `ConformerEncoder.forward`
+#    contains dynamic length checks (`.item()`) that trigger TorchDynamo graph breaks
+#    inside DDP. Compiling each `ConformerLayer` individually with `dynamic=False`
+#    avoids graph breaks and allows clean XLA optimization.
+# 3. RNN-T Loss Dispatch: NeMo's default RNN-T loss relies on `warprnnt_numba`, an x86/CUDA
+#    Numba kernel that cannot execute on TPU. On TPU, we disable `fuse_loss_wer` and
+#    dispatch loss computation to the compiled Pallas/JAX `tpu_rnnt_loss` operator.
 def _patch_rnnt_model():
     from nemo.collections.asr.models import rnnt_models
     from nemo_torchtpu.tpu_rnnt_loss import tpu_rnnt_loss
@@ -250,6 +340,15 @@ def _patch_rnnt_model():
     cls._nemo_torchtpu_patched = True
 
 
+# ==============================================================================
+# 8. Mocking Missing NVIDIA / Upstream Modules
+# ==============================================================================
+# Why this is needed:
+# - NeMo source files (`one_logger_callback.py`, `exp_manager.py`) contain top-level
+#   imports for NVIDIA proprietary packages (`nv_one_logger`) or logger modules
+#   deprecated in newer PyTorch Lightning versions (such as `NeptuneLogger` in Lightning 2.6).
+# - Populating `sys.modules` with lightweight dummy modules before importing NeMo
+#   avoids `ModuleNotFoundError` / `ImportError` on TPU without modifying upstream NeMo files.
 def _mock_missing_nvidia_modules():
     import sys
     import types
